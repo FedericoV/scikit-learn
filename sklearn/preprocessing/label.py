@@ -33,27 +33,59 @@ __all__ = [
 ]
 
 
-def _encode_numpy(values, uniques=None, encode=False):
+def _encode_numpy(values, uniques=None, encode=False, threshold=None):
     # only used in _encode below, see docstring there for details
     if uniques is None:
-        if encode:
-            uniques, encoded = np.unique(values, return_inverse=True)
-            return uniques, encoded
+        if threshold:
+            if encode:
+                uniques, encoded, uniques_count = np.unique(values, return_inverse=True, return_counts=True)
+                
+                uniques_below_threshold = []
+                for u, c in zip(uniques, uniques_count):
+                    if c < threshold:
+                        uniques_below_threshold.append(u)
+                
+                # We want to insure that rare labels get encoded to 0, so we take
+                # advantage of the fact that numpy.uniques assigns label in an
+                # ordinal way, and set the mask variable to one minus the smallest
+                # unique value.
+                mask_val = np.min(uniques) - 1
+
+                # We make a copy of the original value array, and mask all values
+                # that are present less than threshold times.
+                idx_below_threshold = np.isin(values, uniques_below_threshold)
+                values_cp = values.copy()
+                values_cp[idx_below_threshold] = mask_val
+
+                uniques, encoded2 = np.unique(values, return_inverse=True)
+                return uniques, encoded2
         else:
-            # unique sorts
-            return np.unique(values)
+            if encode:
+                uniques, encoded = np.unique(values, return_inverse=True)
+                return uniques, encoded
+            else:
+                # unique sorts
+                return np.unique(values)
     if encode:
-        diff = _encode_check_unknown(values, uniques)
-        if diff:
-            raise ValueError("y contains previously unseen labels: %s"
-                             % str(diff))
-        encoded = np.searchsorted(uniques, values)
+        if not threshold:
+            diff = _encode_check_unknown(values, uniques)
+            if diff:
+                raise ValueError("y contains previously unseen labels: %s"
+                                % str(diff))
+            encoded = np.searchsorted(uniques, values)
+        else:
+            diff, mask = _encode_check_unknown(values, uniques, return_mask=True)
+            
+            # Values that are not in unique are encoded as 0
+            encoded = np.zeros_like(values)
+            encoded[mask] = np.searchsorted(uniques, values[mask])
+
         return uniques, encoded
     else:
         return uniques
 
 
-def _encode_python(values, uniques=None, encode=False):
+def _encode_python(values, uniques=None, encode=False, threshold=None):
     # only used in _encode below, see docstring there for details
     if uniques is None:
         uniques = sorted(set(values))
@@ -69,8 +101,18 @@ def _encode_python(values, uniques=None, encode=False):
     else:
         return uniques
 
+    
+def _convert_threshold(values, threshold):
+    # converts threshold from a floating point number to a minimum
+    # number of observations if threshold is a float
+    n = len(values)
+    if type(threshold) == float:
+        return n*threshold
+    else:
+        return threshold
 
-def _encode(values, uniques=None, encode=False):
+
+def _encode(values, uniques=None, encode=False, threshold=None):
     """Helper function to factorize (find uniques) and encode values.
 
     Uses pure python method for object dtype, and numpy method for
@@ -90,6 +132,9 @@ def _encode(values, uniques=None, encode=False):
         already have been determined in fit).
     encode : bool, default False
         If True, also encode the values into integer codes based on `uniques`.
+    threshold: float or int, default None
+        If specified, uniques that are present less than the threshold amount
+        are encoded as a RARE label (0)
 
     Returns
     -------
@@ -100,14 +145,15 @@ def _encode(values, uniques=None, encode=False):
         If ``encode=True``.
 
     """
+    threshold = _convert_threshold(values, threshold)
     if values.dtype == object:
         try:
-            res = _encode_python(values, uniques, encode)
+            res = _encode_python(values, uniques, encode, threshold)
         except TypeError:
             raise TypeError("argument must be a string or number")
         return res
     else:
-        return _encode_numpy(values, uniques, encode)
+        return _encode_numpy(values, uniques, encode, threshold)
 
 
 def _encode_check_unknown(values, uniques, return_mask=False):
@@ -203,6 +249,19 @@ class LabelEncoder(BaseEstimator, TransformerMixin):
     sklearn.preprocessing.OrdinalEncoder : encode categorical features
         using a one-hot or ordinal encoding scheme.
     """
+    def __init__(self, threshold=None):
+        if threshold is not None:
+            if type(threshold) == float:
+                if threshold >= 1.0 or threshold <= 0:
+                    raise ValueError(("Threshold is either an integer number of observations "
+                                      "or a floating point number between 0 and 1 (exclusive"))
+            elif type(threshold) == int:
+                if threshold < 0:
+                    raise ValueError(("If threshold is an integer, its value has to be greater "
+                                      "than one"))
+                # Note: we need to do a usage time check and raise a warning if 
+                # nobs_threshold is > dataset size.
+        self.threshold = threshold
 
     def fit(self, y):
         """Fit label encoder
@@ -217,7 +276,7 @@ class LabelEncoder(BaseEstimator, TransformerMixin):
         self : returns an instance of self.
         """
         y = column_or_1d(y, warn=True)
-        self.classes_ = _encode(y)
+        self.classes_ = _encode(y, threshold=self.threshold)
         return self
 
     def fit_transform(self, y):
@@ -254,7 +313,7 @@ class LabelEncoder(BaseEstimator, TransformerMixin):
         if _num_samples(y) == 0:
             return np.array([])
 
-        _, y = _encode(y, uniques=self.classes_, encode=True)
+        _, y = _encode(y, uniques=self.classes_, encode=True, threshold=self.threshold)
         return y
 
     def inverse_transform(self, y):
